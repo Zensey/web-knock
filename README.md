@@ -14,10 +14,18 @@ it opens the port by adding origin's IP to the whitelist ipset of firewall.
 
 
 
-### Install
+### Build binary
 
     `make web-knock`
-    `make setup-fw-rules`
+
+## Setup firewall rules (ufw)
+
+At the end of /etc/ufw/before.rules find the last COMMIT line and paste the following before it:
+
+    -A ufw-before-input -p tcp -m tcp --dport 8443 -m set --match-set web_blacklist src -j REJECT
+    -A ufw-before-input -p tcp -m tcp --dport 22 -m set --match-set ssh_whitelist src -j ACCEPT
+    -A ufw-before-input -p tcp --dport 22 -j REJECT
+
 
 ## Run the daemon
 
