@@ -1,32 +1,25 @@
-//go:build linux
-// +build linux
-
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"log"
-	"net"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/zensey/web-knock/model"
+	"github.com/zensey/web-knock/repo"
+	"github.com/zensey/web-knock/utils"
 
-	"github.com/lrh3321/ipset-go"
 	strftime "github.com/ncruces/go-strftime"
 	"github.com/nxadm/tail"
 	"github.com/satyrius/gonx"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 const (
 	setWhite = "ssh_whitelist"
 	setBlack = "web_blacklist"
+	banTTL   = time.Hour
 
 	fileNameDefault = "/var/log/nginx/access.log"
 
@@ -35,17 +28,24 @@ const (
 	logFormat = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
 )
 
-func ipsetAdd(setname, strIP string) {
-	log.Println("ipsetAdd", setname, strIP)
-
-	err := ipset.Create(setname, ipset.TypeHashIP, ipset.CreateOptions{})
-	if err != nil && err.Error() != "file exists" {
-		log.Println(err)
+func blacklistRecreateFromIpset(repo *repo.Repo) {
+	s, _ := utils.IpsetGet(setBlack)
+	for _, r := range s {
+		log.Println(r.IP)
+		repo.BlacklistCreateIfNE(r.IP.String())
 	}
-	ip := net.ParseIP(strIP)
-	err = ipset.Add(setname, &ipset.Entry{IP: ip})
-	if err != nil && err.Error() != "exist" {
-		log.Println(err)
+}
+
+func blacklistClearExpiredBans(repo *repo.Repo) {
+	for {
+		list := repo.GetBlacklist()
+		for _, r := range list {
+			if time.Since(r.Request) > banTTL {
+				utils.IpsetDel(setBlack, r.IP)
+				// repo.blacklistDel(r.IP)
+			}
+		}
+		time.Sleep(5 * time.Minute)
 	}
 }
 
@@ -58,16 +58,13 @@ func main() {
 		return
 	}
 
-	db, err := gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	if err != nil {
-		log.Fatalf(err.Error())
-	}
-	db.AutoMigrate(&model.Blacklist{})
-	p := gonx.NewParser(logFormat)
+	repo := new(repo.Repo)
+	repo.Init()
+	// blacklistRecreateFromIpset()
+	go blacklistClearExpiredBans(repo)
 
-	map1 := make(map[string]window)
+	p := gonx.NewParser(logFormat)
+	ipmap := make(map[string]model.Window)
 
 	handleLine := func(l string) {
 		e, _ := p.ParseString(l)
@@ -80,36 +77,22 @@ func main() {
 		reqa := strings.Split(req, " ")
 		if len(reqa) == 3 && reqa[1] == *key {
 			// Knock
-			ipsetAdd(setWhite, remote)
+			utils.IpsetAdd(setWhite, remote)
 			return
 		}
 
-		if status == "404" || status == "400" {
-			count := putEvent(map1, remote, time)
-			if count == 4 {
+		if strings.HasPrefix(status, "40") { // 40x
+			count := model.PutEvent(ipmap, remote, time)
 
+			if count == 4 {
 				rec := &model.Blacklist{IP: remote, Request: time}
-				db.Save(rec)
-				ipsetAdd(setBlack, remote)
+				repo.SaveBlacklist(rec)
+				utils.IpsetAdd(setBlack, remote)
 			}
 		}
 	}
 
 	for {
-		func() {
-			file, err := os.Open(*fileName)
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer file.Close()
-
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				t := scanner.Text()
-				handleLine(t)
-			}
-		}()
-
 		t, err := tail.TailFile(*fileName, tail.Config{Follow: true, MustExist: false})
 		if err != nil {
 			log.Fatal(err)
@@ -117,6 +100,7 @@ func main() {
 		for line := range t.Lines {
 			handleLine(line.Text)
 		}
+
 		fmt.Println("wait 1 sec & try to reopen the log")
 		time.Sleep(1 * time.Second)
 	}
